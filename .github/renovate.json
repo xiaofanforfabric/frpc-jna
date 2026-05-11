@@ -1,0 +1,38 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "enabled": true,
+  "packageRules": [
+    {
+      "description": "跟踪上游 fatedier/frp 更新",
+      "matchManagers": ["gitlabci", "github-actions"],
+      "enabled": false
+    }
+  ],
+  "regexManagers": [
+    {
+      "description": "检测上游 frp 新版本并创建 PR",
+      "fileMatch": ["^README\\.md$"],
+      "matchStrings": [
+        "基于 \\[fatedier/frp\\]\\(https://github.com/fatedier/frp\\) v(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "fatedier/frp",
+      "versioningTemplate": "semver"
+    }
+  ],
+  "postUpdateOptions": ["gomodTidy"],
+  "automerge": false,
+  "labels": ["dependencies", "frp-upstream"],
+  "reviewers": ["xiaofanforfabric"],
+  "prBodyNotes": [
+    "上游 frp 发布了新版本 v{{version}}。",
+    "",
+    "### 合并前检查清单",
+    "- [ ] `jna/jna.go` 与新版本兼容",
+    "- [ ] 编译 `frpc_jna.dll` 测试通过",
+    "- [ ] Java 端 `FrpcJnaBridge.java` 接口无需修改"
+  ]
+}
