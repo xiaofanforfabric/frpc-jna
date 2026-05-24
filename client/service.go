@@ -464,6 +464,17 @@ func (svr *Service) getVisitorCfg(name string) (v1.VisitorConfigurer, bool) {
 	return ctl.vm.GetVisitorCfg(name)
 }
 
+// GetControlConn returns the underlying control connection if available.
+// This is used by JNA bridge to forcefully close the connection when stopping.
+func (svr *Service) GetControlConn() net.Conn {
+	svr.ctlMu.RLock()
+	defer svr.ctlMu.RUnlock()
+	if svr.ctl == nil {
+		return nil
+	}
+	return svr.ctl.sessionCtx.Conn
+}
+
 func (svr *Service) StatusExporter() StatusExporter {
 	return &statusExporterImpl{
 		getProxyStatusFunc: svr.getProxyStatus,

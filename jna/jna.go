@@ -12,6 +12,11 @@
 //     void FrpcFreeString(String str);
 //     String FrpcGetLastError();
 //     void FrpcSetLogLevel(String level);
+//     // 多实例接口
+//     int FrpcStartWithId(int id, String configPath);
+//     int FrpcStopWithId(int id);
+//     int FrpcIsRunningWithId(int id);
+//     int FrpcStopAll();
 // }
 
 package main
@@ -26,6 +31,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/fatedier/frp/client"
@@ -37,15 +43,25 @@ import (
 	"github.com/fatedier/frp/pkg/util/log"
 )
 
-// 服务实例管理
+// 服务实例管理 - 支持多实例
+type serviceInstance struct {
+	service *client.Service
+	cancel  context.CancelFunc
+	running bool
+	done    chan struct{}
+}
+
 var (
-	activeService  *client.Service
-	serviceCancel  context.CancelFunc
-	serviceMu      sync.Mutex
-	serviceRunning bool
-	lastError      string
-	lastErrorMu    sync.Mutex
+	instances   map[int]*serviceInstance
+	instancesMu sync.Mutex
+	lastError   string
+	lastErrorMu sync.Mutex
+	nextID      int
 )
+
+func init() {
+	instances = make(map[int]*serviceInstance)
+}
 
 func setLastError(err string) {
 	lastErrorMu.Lock()
@@ -59,19 +75,8 @@ func getLastError() string {
 	return lastError
 }
 
-//export FrpcStart
-// 启动 frpc 客户端
-// configPath: 配置文件路径 (UTF-8)
-// 返回: 0=成功, -1=失败
-func FrpcStart(configPath *C.char) C.int {
-	serviceMu.Lock()
-	defer serviceMu.Unlock()
-
-	if serviceRunning {
-		return 0 // 已经在运行
-	}
-
-	cfgPath := C.GoString(configPath)
+// 内部启动逻辑，返回 instanceID
+func startInstance(cfgPath string) (int, error) {
 	if cfgPath == "" {
 		cfgPath = "frpc.ini"
 	}
@@ -82,10 +87,7 @@ func FrpcStart(configPath *C.char) C.int {
 	// 加载配置
 	result, err := config.LoadClientConfigResult(cfgPath, true)
 	if err != nil {
-		errMsg := "加载配置文件失败: " + err.Error()
-		setLastError(errMsg)
-		log.Warnf("[JNA] %s", errMsg)
-		return -1
+		return -1, fmt.Errorf("加载配置文件失败: %v", err)
 	}
 	if result.IsLegacyFormat {
 		log.Warnf("[JNA] WARNING: ini format is deprecated, please use yaml/json/toml format instead!")
@@ -93,20 +95,14 @@ func FrpcStart(configPath *C.char) C.int {
 
 	if len(result.Common.FeatureGates) > 0 {
 		if err := featuregate.SetFromMap(result.Common.FeatureGates); err != nil {
-			errMsg := "设置 feature gates 失败: " + err.Error()
-			setLastError(errMsg)
-			log.Warnf("[JNA] %s", errMsg)
-			return -1
+			return -1, fmt.Errorf("设置 feature gates 失败: %v", err)
 		}
 	}
 
 	// 创建配置源
 	configSource := source.NewConfigSource()
 	if err := configSource.ReplaceAll(result.Proxies, result.Visitors); err != nil {
-		errMsg := "设置配置源失败: " + err.Error()
-		setLastError(errMsg)
-		log.Warnf("[JNA] %s", errMsg)
-		return -1
+		return -1, fmt.Errorf("设置配置源失败: %v", err)
 	}
 
 	var storeSource *source.StoreSource
@@ -119,10 +115,7 @@ func FrpcStart(configPath *C.char) C.int {
 			Path: storePath,
 		})
 		if err != nil {
-			errMsg := "创建 store source 失败: " + err.Error()
-			setLastError(errMsg)
-			log.Warnf("[JNA] %s", errMsg)
-			return -1
+			return -1, fmt.Errorf("创建 store source 失败: %v", err)
 		}
 		storeSource = s
 	}
@@ -134,10 +127,7 @@ func FrpcStart(configPath *C.char) C.int {
 
 	proxyCfgs, visitorCfgs, err := aggregator.Load()
 	if err != nil {
-		errMsg := "从配置源加载配置失败: " + err.Error()
-		setLastError(errMsg)
-		log.Warnf("[JNA] %s", errMsg)
-		return -1
+		return -1, fmt.Errorf("从配置源加载配置失败: %v", err)
 	}
 
 	proxyCfgs, visitorCfgs = config.FilterClientConfigurers(result.Common, proxyCfgs, visitorCfgs)
@@ -149,10 +139,7 @@ func FrpcStart(configPath *C.char) C.int {
 		log.Warnf("[JNA] 配置警告: %v", warning)
 	}
 	if err != nil {
-		errMsg := "配置验证失败: " + err.Error()
-		setLastError(errMsg)
-		log.Warnf("[JNA] %s", errMsg)
-		return -1
+		return -1, fmt.Errorf("配置验证失败: %v", err)
 	}
 
 	// 创建服务
@@ -163,67 +150,192 @@ func FrpcStart(configPath *C.char) C.int {
 		ConfigFilePath:         cfgPath,
 	})
 	if err != nil {
-		errMsg := "创建 frpc 服务失败: " + err.Error()
-		setLastError(errMsg)
-		log.Warnf("[JNA] %s", errMsg)
-		return -1
+		return -1, fmt.Errorf("创建 frpc 服务失败: %v", err)
 	}
 
-	// 启动服务
+	// 分配 ID
+	instancesMu.Lock()
+	id := nextID
+	nextID++
 	ctx, cancel := context.WithCancel(context.Background())
-	serviceCancel = cancel
-	activeService = svr
-	serviceRunning = true
+	inst := &serviceInstance{
+		service: svr,
+		cancel:  cancel,
+		running: true,
+		done:    make(chan struct{}),
+	}
+	instances[id] = inst
+	instancesMu.Unlock()
 
+	// 启动服务
 	go func() {
 		defer func() {
-			serviceMu.Lock()
-			serviceRunning = false
-			activeService = nil
-			serviceMu.Unlock()
-			log.Infof("[JNA] frpc 服务已停止")
+			instancesMu.Lock()
+			inst.running = false
+			instancesMu.Unlock()
+			log.Infof("[JNA] frpc 服务 #%d 已停止", id)
 		}()
+		defer close(inst.done)
 
-		log.Infof("[JNA] frpc 服务已启动")
+		log.Infof("[JNA] frpc 服务 #%d 已启动", id)
 		if err := svr.Run(ctx); err != nil {
-			errMsg := "frpc 服务运行出错: " + err.Error()
+			errMsg := fmt.Sprintf("frpc 服务 #%d 运行出错: %v", id, err)
 			setLastError(errMsg)
 			log.Warnf("[JNA] %s", errMsg)
 		}
 	}()
 
+	return id, nil
+}
+
+// 内部停止逻辑
+func stopInstance(id int) error {
+	instancesMu.Lock()
+	inst, ok := instances[id]
+	if !ok || !inst.running || inst.service == nil {
+		instancesMu.Unlock()
+		return nil
+	}
+	delete(instances, id)
+	instancesMu.Unlock()
+
+	// 步骤1: 先尝试优雅关闭
+	// GracefulClose 内部调用 svr.cancel(nil)，
+	// 触发 svr.Run() 退出 → svr.stop() → ctl.GracefulClose(500ms)
+	// → ctl.pm.Close() → 每个 proxy 发送 CloseProxy 消息给服务端
+	// → time.Sleep(500ms) 等待消息发送完成 → 关闭连接
+	inst.service.GracefulClose(500 * 1000 * 1000) // 500ms in nanoseconds
+	inst.cancel()
+
+	// 步骤2: 直接关闭底层 TCP 连接，确保服务端立即检测到断开
+	// 即使 CloseProxy 消息因网络延迟未发送完成，TCP FIN/RST 包
+	// 也会让服务端立即知道客户端已离线
+	if conn := inst.service.GetControlConn(); conn != nil {
+		conn.Close()
+		log.Infof("[JNA] frpc 服务 #%d 底层连接已强制关闭", id)
+	}
+
+	// 步骤3: 等待 svr.Run() 的 goroutine 完成
+	// 最多等待 3 秒，避免死锁
+	select {
+	case <-inst.done:
+	case <-time.After(3 * time.Second):
+		log.Warnf("[JNA] frpc 服务 #%d 关闭超时", id)
+	}
+
+	log.Infof("[JNA] frpc 服务 #%d 已停止", id)
+	return nil
+}
+
+//export FrpcStart
+// 启动 frpc 客户端（兼容旧接口，单例模式）
+// configPath: 配置文件路径 (UTF-8)
+// 返回: 0=成功, -1=失败
+func FrpcStart(configPath *C.char) C.int {
+	cfgPath := C.GoString(configPath)
+	id, err := startInstance(cfgPath)
+	if err != nil {
+		setLastError(err.Error())
+		log.Warnf("[JNA] FrpcStart 失败: %s", err.Error())
+		return -1
+	}
+	log.Infof("[JNA] FrpcStart 成功, instanceID=%d", id)
 	return 0
 }
 
 //export FrpcStop
-// 停止 frpc 客户端
-// 返回: 0=成功, -1=失败
+// 停止 frpc 客户端（兼容旧接口，停止所有实例）
+// 返回: 0=成功
 func FrpcStop() C.int {
-	serviceMu.Lock()
-	defer serviceMu.Unlock()
-
-	if !serviceRunning || activeService == nil {
-		return 0
+	instancesMu.Lock()
+	ids := make([]int, 0, len(instances))
+	for id := range instances {
+		ids = append(ids, id)
 	}
+	instancesMu.Unlock()
 
-	activeService.GracefulClose(500 * 1000 * 1000) // 500ms in nanoseconds
-	serviceCancel()
-	serviceRunning = false
-	activeService = nil
-
-	log.Infof("[JNA] frpc 服务已停止")
+	for _, id := range ids {
+		stopInstance(id)
+	}
+	log.Infof("[JNA] FrpcStop 已停止 %d 个实例", len(ids))
 	return 0
 }
 
 //export FrpcIsRunning
-// 检查 frpc 是否在运行
-// 返回: 1=运行中, 0=已停止
+// 检查是否有 frpc 实例在运行
+// 返回: 1=有运行中的实例, 0=全部已停止
 func FrpcIsRunning() C.int {
-	serviceMu.Lock()
-	defer serviceMu.Unlock()
-	if serviceRunning {
+	instancesMu.Lock()
+	defer instancesMu.Unlock()
+	for _, inst := range instances {
+		if inst.running {
+			return 1
+		}
+	}
+	return 0
+}
+
+// ====== 多实例接口 ======
+
+//export FrpcStartWithId
+// 启动 frpc 客户端，返回实例 ID
+// id: 由调用方指定的实例 ID（必须 >= 0）
+// configPath: 配置文件路径 (UTF-8)
+// 返回: 实际分配的 instanceID（>=0）, -1=失败
+func FrpcStartWithId(id C.int, configPath *C.char) C.int {
+	cfgPath := C.GoString(configPath)
+	instanceID, err := startInstance(cfgPath)
+	if err != nil {
+		setLastError(err.Error())
+		log.Warnf("[JNA] FrpcStartWithId 失败: %s", err.Error())
+		return -1
+	}
+	log.Infof("[JNA] FrpcStartWithId 成功, instanceID=%d", instanceID)
+	return C.int(instanceID)
+}
+
+//export FrpcStopWithId
+// 停止指定 ID 的 frpc 实例
+// id: 实例 ID
+// 返回: 0=成功, -1=失败
+func FrpcStopWithId(id C.int) C.int {
+	err := stopInstance(int(id))
+	if err != nil {
+		setLastError(err.Error())
+		return -1
+	}
+	return 0
+}
+
+//export FrpcIsRunningWithId
+// 检查指定 ID 的 frpc 实例是否在运行
+// id: 实例 ID
+// 返回: 1=运行中, 0=已停止
+func FrpcIsRunningWithId(id C.int) C.int {
+	instancesMu.Lock()
+	defer instancesMu.Unlock()
+	inst, ok := instances[int(id)]
+	if ok && inst.running {
 		return 1
 	}
+	return 0
+}
+
+//export FrpcStopAll
+// 停止所有 frpc 实例
+// 返回: 0=成功
+func FrpcStopAll() C.int {
+	instancesMu.Lock()
+	ids := make([]int, 0, len(instances))
+	for id := range instances {
+		ids = append(ids, id)
+	}
+	instancesMu.Unlock()
+
+	for _, id := range ids {
+		stopInstance(id)
+	}
+	log.Infof("[JNA] FrpcStopAll 已停止 %d 个实例", len(ids))
 	return 0
 }
 
